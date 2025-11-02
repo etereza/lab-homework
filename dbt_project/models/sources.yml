@@ -1,0 +1,9 @@
+
+version: 2
+sources:
+  - name: core
+    database: "{{ target.database }}"
+    schema: core
+    tables:
+      - name: weather_daily_clean
+      - name: tourism_monthly_clean

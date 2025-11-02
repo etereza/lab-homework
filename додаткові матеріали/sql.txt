@@ -1,0 +1,265 @@
+-- 0) Базові об’єкти
+CREATE SCHEMA IF NOT EXISTS marts;
+
+CREATE SEQUENCE IF NOT EXISTS marts.dim_region_sk_seq;
+
+CREATE TABLE IF NOT EXISTS marts.dim_region (
+    region_sk     BIGINT PRIMARY KEY DEFAULT nextval('marts.dim_region_sk_seq'),
+    -- бізнес-ключ
+    region_name   TEXT        NOT NULL,
+    country_code  TEXT        NOT NULL,
+    -- довідкові
+    lat           NUMERIC(9,6),
+    lon           NUMERIC(9,6),
+    timezone      TEXT,
+    -- SCD2
+    valid_from    TIMESTAMPTZ NOT NULL,
+    valid_to      TIMESTAMPTZ NOT NULL DEFAULT '9999-12-31 23:59:59+00',
+    is_current    BOOLEAN     NOT NULL DEFAULT TRUE,
+    -- технічне
+    src_hash      TEXT        NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS dim_region_bk_idx
+    ON marts.dim_region(region_name, country_code);
+
+CREATE INDEX IF NOT EXISTS dim_region_is_current_idx
+    ON marts.dim_region(is_current);
+
+CREATE UNIQUE INDEX IF NOT EXISTS dim_region_bk_current_uk
+    ON marts.dim_region(region_name, country_code)
+    WHERE is_current;
+
+INSERT INTO marts.dim_region (
+    region_name, country_code, lat, lon, timezone, valid_from, src_hash
+)
+VALUES (
+    'Drohobych', 'UA', 49.353, 23.505, 'Europe/Kyiv',
+    now(), md5('Drohobych|UA|49.353|23.505|Europe/Kyiv')
+)
+ON CONFLICT DO NOTHING;
+
+
+ALTER TABLE marts.dim_region
+  ADD COLUMN IF NOT EXISTS region_sk BIGSERIAL;
+
+-- Зроби його первинним ключем
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'marts.dim_region'::regclass
+      AND contype  = 'p'
+  ) THEN
+    ALTER TABLE marts.dim_region
+      ADD CONSTRAINT dim_region_pk PRIMARY KEY (region_sk);
+  END IF;
+END$$;
+
+
+
+CREATE TABLE IF NOT EXISTS marts.dim_weather_bins (
+    temp_bin_sk   SMALLSERIAL PRIMARY KEY,
+    bin_name         TEXT UNIQUE NOT NULL,  -- 'Freezing', 'Cold', ...
+    t_min         DOUBLE PRECISION NOT NULL,
+    t_max         DOUBLE PRECISION NOT NULL
+);
+ALTER TABLE marts.dim_weather_bins
+  ADD CONSTRAINT dim_weather_bins_bin_name_uk UNIQUE (bin_name);
+
+-- наповнення (ідемпотентно)
+INSERT INTO marts.dim_weather_bins (bin_name, t_min, t_max) VALUES
+  ('Freezing',  -80.0,   0.0),
+  ('Cold',         0.0,   5.0),
+  ('Cool',         5.0,  12.0),
+  ('Mild',        12.0,  18.0),
+  ('Warm',        18.0,  25.0),
+  ('Hot',         25.0, 80.0)
+ON CONFLICT (bin_name) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS marts.fact_tourism_weather (
+  month_start     DATE    NOT NULL,
+  region          BIGINT  NOT NULL,      -- FK -> dim_region.region_sk
+  tourists_total  INTEGER NOT NULL,
+  tourists_women  INTEGER,
+  tourists_men    INTEGER,
+  avg_temp_c      NUMERIC,
+  days_with_rain  INTEGER,
+  wind_speed      float8,
+  days_observed   INTEGER,
+  CONSTRAINT fact_tourism_weather_pk
+      PRIMARY KEY (month_start, region),
+  CONSTRAINT fact_tourism_weather_region_fk
+      FOREIGN KEY (region)
+      REFERENCES marts.dim_region(region_sk) ON UPDATE CASCADE
+);
+
+-- 2) Завантаження факту (туризм + погода)
+WITH w AS (  -- погода: агрегація за місяць і регіон
+    SELECT
+        date_trunc('month', wd.dt)::date      AS month_start,
+        r.region_sk                           AS region_sk,
+        avg(wd.avg_temp_c)                    AS avg_temp_c,
+        sum((wd.precipitation_mm > 0)::int)   AS days_with_rain,
+        count(*)                              AS days_observed,
+        avg(wd.wind_speed_avg_ms)             AS wind_speed_avg_ms
+    FROM core.weather_daily_clean wd
+    JOIN marts.dim_region r
+      ON r.region = 'Drohobych'              -- фіксований регіон
+    GROUP BY 1,2
+),
+t AS (  -- туризм: агрегація за місяць і регіон
+    SELECT
+        date_trunc('month', tm.month_start)::date AS month_start,
+        r.region_sk                               AS region_sk,
+        sum(tm.tourists_total)                    AS tourists_total,
+        sum(tm.female_count)                      AS tourists_women,
+        sum(tm.male_count)                        AS tourists_men
+    FROM core.tourism_monthly_clean tm
+    JOIN marts.dim_region r
+      ON r.region = 'Drohobych'
+    GROUP BY 1,2
+)
+
+INSERT INTO marts.fact_tourism_weather (
+    month_start,
+    region,
+    tourists_total,
+    tourists_women,
+    tourists_men,
+    avg_temp_c,
+    days_with_rain,
+    wind_speed,
+    days_observed
+)
+SELECT
+    COALESCE(t.month_start, w.month_start) AS month_start,
+    COALESCE(t.region_sk,  w.region_sk)    AS region,          -- мапимо region_sk -> region
+    t.tourists_total,
+    t.tourists_women,
+    t.tourists_men,
+    w.avg_temp_c,
+    w.days_with_rain,
+    w.wind_speed_avg_ms                    AS wind_speed,
+    w.days_observed
+FROM t
+FULL OUTER JOIN w
+  ON  t.month_start = w.month_start
+  AND t.region_sk   = w.region_sk
+ON CONFLICT (month_start, region) DO UPDATE
+SET
+    tourists_total  = EXCLUDED.tourists_total,
+    tourists_women  = EXCLUDED.tourists_women,
+    tourists_men    = EXCLUDED.tourists_men,
+    avg_temp_c      = EXCLUDED.avg_temp_c,
+    days_with_rain  = EXCLUDED.days_with_rain,
+    wind_speed      = EXCLUDED.wind_speed,
+    days_observed   = EXCLUDED.days_observed;
+
+-- 3) Факт щоденний (виправлені назви колонок і PK)
+CREATE TABLE IF NOT EXISTS marts.fact_weather_daily (
+    day                DATE        NOT NULL,
+    region             BIGINT      NOT NULL REFERENCES marts.dim_region(region_sk),
+    avg_temp_c         DOUBLE PRECISION,
+    min_temp_c         DOUBLE PRECISION,
+    max_temp_c         DOUBLE PRECISION,
+    precipitation_mm   DOUBLE PRECISION,
+    is_rain            BOOLEAN,
+    CONSTRAINT fact_weather_daily_pk PRIMARY KEY (day, region)
+);
+
+WITH r AS (
+    SELECT region_sk
+    FROM marts.dim_region
+    WHERE is_current = TRUE
+    LIMIT 1
+)
+INSERT INTO marts.fact_weather_daily (
+    day, region, avg_temp_c, min_temp_c, max_temp_c, precipitation_mm, is_rain
+)
+SELECT
+    wd.dt::date,
+    r.region_sk,
+    wd.avg_temp_c,
+    wd.min_temp_c,
+    wd.max_temp_c,
+    wd.precipitation_mm,
+    (wd.precipitation_mm > 0)
+FROM core.weather_daily_clean wd
+CROSS JOIN r
+ON CONFLICT (day, region) DO UPDATE
+SET  avg_temp_c       = EXCLUDED.avg_temp_c,
+     min_temp_c       = EXCLUDED.min_temp_c,
+     max_temp_c       = EXCLUDED.max_temp_c,
+     precipitation_mm = EXCLUDED.precipitation_mm,
+     is_rain          = EXCLUDED.is_rain;
+
+-- 4) Сезони (ок)
+CREATE TABLE IF NOT EXISTS marts.dim_season (
+    season_sk   SMALLSERIAL PRIMARY KEY,
+    season_name TEXT UNIQUE NOT NULL
+);
+
+INSERT INTO marts.dim_season (season_name)
+VALUES ('Winter'), ('Spring'), ('Summer'), ('Autumn')
+ON CONFLICT (season_name) DO NOTHING;
+
+-- 5) Календар дат — одна, цілісна модель
+CREATE TABLE IF NOT EXISTS marts.dim_date (
+    date_sk     BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    dte         DATE UNIQUE NOT NULL,      -- натуральна дата
+    year        INT  NOT NULL,
+    month_num   INT  NOT NULL,
+    day         INT  NOT NULL,
+    quarter     INT  NOT NULL,
+    month_name  TEXT NOT NULL,
+    day_name    TEXT NOT NULL,
+    is_weekend  BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- наповнення / оновлення
+INSERT INTO marts.dim_date
+  (date, year, month_num, day, quarter, month_name, day_name, is_weekend)
+SELECT
+  d::date                                           AS dte,
+  EXTRACT(YEAR    FROM d)::int                      AS year,
+  EXTRACT(MONTH   FROM d)::int                      AS month_num,
+  EXTRACT(DAY     FROM d)::int                      AS day,
+  EXTRACT(QUARTER FROM d)::int                      AS quarter,
+  TO_CHAR(d, 'FMMonth')                             AS month_name,
+  TO_CHAR(d, 'FMDay')                               AS day_name,
+  (EXTRACT(ISODOW FROM d) IN (6, 7))                AS is_weekend
+FROM generate_series('2020-01-01'::date,
+                     '2025-12-31'::date,
+                     interval '1 day') AS t(d)
+ON CONFLICT (dte) DO UPDATE
+SET
+  year       = EXCLUDED.year,
+  month_num  = EXCLUDED.month_num,
+  day        = EXCLUDED.day,
+  quarter    = EXCLUDED.quarter,
+  month_name = EXCLUDED.month_name,
+  day_name   = EXCLUDED.day_name,
+  is_weekend = EXCLUDED.is_weekend;
+
+-- 6) Звʼязок факту з датами через surrogate key
+ALTER TABLE marts.fact_tourism_weather
+  ADD COLUMN IF NOT EXISTS date_sk BIGINT;
+
+UPDATE marts.fact_tourism_weather f
+SET date_sk = d.date_sk
+FROM marts.dim_date d
+WHERE d.dte = f.month_start;
+
+ALTER TABLE marts.fact_tourism_weather
+  ALTER COLUMN date_sk SET NOT NULL;
+
+ALTER TABLE marts.fact_tourism_weather
+  ADD CONSTRAINT fact_tourism_weather_date_fk
+  FOREIGN KEY (date_sk) REFERENCES marts.dim_date(date_sk);
+
+CREATE INDEX IF NOT EXISTS fact_tourism_weather_date_idx
+  ON marts.fact_tourism_weather (date_sk);
+
+CREATE INDEX IF NOT EXISTS fact_tourism_weather_region_idx
+  ON marts.fact_tourism_weather (region);

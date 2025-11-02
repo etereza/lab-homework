@@ -1,0 +1,14 @@
+tourism_weather_dbt:
+  outputs:
+    prod:
+      type: postgres
+      host: postgresql-tereza.alwaysdata.net  
+      port: 5432
+      user: tereza                             
+      password: sE986DvvfvB#QWd                  
+      dbname: tereza_tourist                     
+      schema: marts                           
+      threads: 4
+      sslmode: require                         
+      keepalives_idle: 0
+  target: prod

@@ -1,0 +1,1 @@
+select * from "tereza_tourist"."core"."stg_tourism"

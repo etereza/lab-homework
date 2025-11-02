@@ -1,0 +1,68 @@
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: airflow-postgres-1
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  scheduler:
+    build: .
+    image: airflow-with-dbt:2.9.2
+    container_name: airflow-scheduler-1
+    command: >
+      bash -lc "airflow db init &&
+                airflow users create -u admin -p admin -r Admin -e admin@example.org -f Admin -l User &&
+                exec airflow scheduler"
+    environment:
+      AIRFLOW__CORE__FERNET_KEY: Xxc2L5W3lCYvt6BRuRoRSvpeE1kI1CRWtfjOGLASjNY=
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: my_secret_key
+      TZ: Europe/Kyiv
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ../dbt_project:/opt/airflow/dbt_project
+      
+  webserver:
+    build: .
+    image: airflow-with-dbt:2.9.2
+    container_name: airflow-webserver-1
+    command: >
+      bash -lc "airflow db check && exec airflow webserver"
+    environment:
+      AIRFLOW__CORE__FERNET_KEY: Xxc2L5W3lCYvt6BRuRoRSvpeE1kI1CRWtfjOGLASjNY=
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: my_secret_key
+      TZ: Europe/Kyiv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      scheduler:
+        condition: service_started
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ../dbt_project:/opt/airflow/dbt_project  
+
+volumes:
+  pg_data:
+  logs:

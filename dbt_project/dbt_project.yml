@@ -1,0 +1,14 @@
+name: tourism_weather
+version: '1.0'
+config-version: 2
+
+models:
+  tourism_weather:
+    staging:
+      +schema: core
+    intermediate:
+      +schema: core
+    marts:
+      +schema: marts
+
+profile: tourism_weather_dbt

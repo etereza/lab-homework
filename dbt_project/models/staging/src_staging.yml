@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: staging
+    database: tereza_final
+    schema: staging
+    tables:
+      - name: weather_daily
+      - name: tourism_monthly
